@@ -8,7 +8,12 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  recordRetrySessionAgent,
+  registerRetrySession,
+  unregisterRetrySession,
+} from "../../src/session-registry.js";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -21,11 +26,13 @@ afterEach(() => {
 // ── Helpers ──
 
 let activeMockAgent: MockAgentInstance | undefined;
+let activeMockSessionManager: { getEntries: ReturnType<typeof vi.fn> } | undefined;
+let activeMockOwner: object | undefined;
 
 interface MockAgentInstance {
   listeners: Set<Function>;
-  waitForIdle: ReturnType<typeof vi.fn>;
-  prompt: ReturnType<typeof vi.fn>;
+  waitForIdle: any;
+  prompt: any;
   state: { isStreaming: boolean; messages: any[] };
   subscribe(listener: Function): () => boolean;
   _setIsStreaming(val: boolean): void;
@@ -81,10 +88,20 @@ function createMockAPI() {
 }
 
 function createMockCtx(entries: unknown[] = []) {
+  const sessionManager = activeMockSessionManager ?? { getEntries: vi.fn() };
+  sessionManager.getEntries.mockReturnValue(entries);
+  if (activeMockAgent && activeMockSessionManager && activeMockOwner) {
+    recordRetrySessionAgent(activeMockSessionManager, activeMockAgent as any);
+    registerRetrySession(activeMockSessionManager, activeMockOwner, {
+      isChild: false,
+      suppressNativeRetry: true,
+      childRetryEnabled: false,
+    });
+  }
   return {
-    ui: { notify: vi.fn() },
-    sessionManager: { getEntries: vi.fn().mockReturnValue(entries) },
-  } as unknown as ExtensionCommandContext;
+    ui: { notify: vi.fn(), setStatus: vi.fn() },
+    sessionManager,
+  } as any;
 }
 
 function errorEntry(errorMessage: string, stopReason = "error"): object {
@@ -106,26 +123,30 @@ function fireAgentEndAsync(
 }
 
 async function advanceThroughRetry(ms = 2500) {
-  await vi.advanceTimersByTimeAsync(ms);
+  const step = 100;
+  for (let remaining = ms; remaining > 0; remaining -= step) {
+    await vi.advanceTimersByTimeAsync(Math.min(step, remaining));
+  }
 }
 
 // Set up the extension with a mock agent that has controllable messages.
 async function setup(agentOverrides?: Parameters<typeof createMockAgent>[0]) {
   vi.resetModules();
 
-  const { Agent } = await import("@earendil-works/pi-agent-core");
-  const origSubscribe = Agent.prototype.subscribe;
-  const origContinue = Agent.prototype.continue;
+  const { AgentSession } = await import("@earendil-works/pi-coding-agent");
+  const origPrepareRetry = (AgentSession.prototype as any)._prepareRetry;
 
   const mod = await import("../../retry.ts");
   const factory = mod.default;
 
   const { api, handlers, commands, sendMessage } = createMockAPI();
   factory(api);
+  const sessionManager = { getEntries: vi.fn() };
+  activeMockSessionManager = sessionManager;
+  activeMockOwner = api as unknown as object;
 
   const agent = createMockAgent(agentOverrides);
   activeMockAgent = agent;
-  Agent.prototype.subscribe.call(agent, vi.fn());
 
   return {
     api,
@@ -133,11 +154,13 @@ async function setup(agentOverrides?: Parameters<typeof createMockAgent>[0]) {
     commands,
     agent,
     sendMessage,
-    origContinue,
+    origContinue: (await import("@earendil-works/pi-agent-core")).Agent.prototype.continue,
     restore: () => {
-      Agent.prototype.subscribe = origSubscribe;
-      Agent.prototype.continue = origContinue;
+      unregisterRetrySession(sessionManager, activeMockOwner ?? api as unknown as object);
+      (AgentSession.prototype as any)._prepareRetry = origPrepareRetry;
       activeMockAgent = undefined;
+      activeMockSessionManager = undefined;
+      activeMockOwner = undefined;
     },
   };
 }
@@ -491,7 +514,7 @@ describe("context overflow defers to compaction", () => {
 
       expect(ctx.ui.notify).toHaveBeenCalled();
       const messages = ctx.ui.notify.mock.calls.map((c: any) => c[0] as string);
-      expect(messages.some((m) => /Context overflow/i.test(m))).toBe(true);
+      expect(messages.some((m: string) => /Context overflow/i.test(m))).toBe(true);
     } finally {
       restore();
     }
@@ -661,10 +684,10 @@ describe("built-in retry coordination", () => {
   });
 });
 
-// ── Bug 5: UI notifications for retries ──
+// ── Bug 5: One mutable status row for retry countdowns ──
 
-describe("retry notifications", () => {
-  it("notifies user about retry attempts", async () => {
+describe("retry countdown status", () => {
+  it("shows retry attempts without adding notification lines", async () => {
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() => {
         const count = agent.prompt.mock.calls.length;
@@ -692,10 +715,14 @@ describe("retry notifications", () => {
       // Advance through multiple backoff sleeps
       await advanceThroughRetry(15000);
 
-      expect(ctx.ui.notify).toHaveBeenCalled();
-      const calls = ctx.ui.notify.mock.calls.map((c: any) => c[0]);
-      const retryCalls = calls.filter((c: string) => c.includes("Retry attempt"));
+      expect(ctx.ui.setStatus).toHaveBeenCalled();
+      const calls = ctx.ui.setStatus.mock.calls;
+      const retryCalls = calls.filter((c: any[]) => typeof c[1] === "string" && c[1].includes("Retry attempt"));
       expect(retryCalls.length).toBeGreaterThanOrEqual(1);
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+        expect.stringContaining("Retry attempt"),
+        "info",
+      );
     } finally {
       restore();
     }

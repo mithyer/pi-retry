@@ -341,3 +341,50 @@ pi install npm:@georgebashi/pi-retry
 ## License
 
 MIT
+
+## Subagent retry policies
+
+Sessions that should retry with a different policy can be selected by matching
+their effective system prompt. This is user configuration: the extension ships
+no built-in marker or identity check for any specific subagent tool.
+
+```json
+{
+  "piRetry": {
+    "subagents": {
+      "enabled": true,
+      "match": {
+        "systemPromptRegex": [
+          {
+            "pattern": "^<active_agent name=\"[^\"\\r\\n]+\"/>$",
+            "flags": "m"
+          }
+        ]
+      },
+      "baseDelayMs": 1000,
+      "maxDelayMs": 10000,
+      "maxRetriesAtMaxDelay": 2
+    }
+  }
+}
+```
+
+Semantics:
+
+- Sessions whose effective system prompt matches any listed rule use the
+  inline child policy; rules combine with OR.
+- Omitted child fields inherit from the effective top-level policy, field by
+  field. Project matcher lists replace global ones.
+- A matching rule with `enabled: false` leaves pi's native retry scheduler
+  untouched; a missing, empty, malformed, or nonmatching configuration keeps
+  the ordinary `pi-retry` takeover.
+- Patterns are compiled when settings resolve. Invalid syntax, unsupported or
+  duplicate flags, and malformed groups warn and become no-match instead of
+  matching everything.
+- The extension must also be loaded in the target session (for pi-subagents
+  that means listing it in the child's `subagentOnlyExtensions`), not only in
+the parent.
+
+The example pattern above matches the `<active_agent name="…"/>` line that
+`pi-subagents` prefixes to native child system prompts; substitute your own
+marker if you select child sessions differently.
